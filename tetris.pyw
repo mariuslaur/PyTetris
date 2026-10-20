@@ -238,6 +238,11 @@ class Shape:
         if not self.game.gamePaused and self.okToMoveDown():
             self.move(0, 1)
 
+    def moveDownSingleThreaded(self):
+        """Moves the piece down instantly without sleeping, relying on .after timing."""
+        if not self.game.gamePaused and self.okToMoveDown():
+            self.move(0, 1)
+
     def moveLeft(self):
         self.moveSide = True
         if not self.game.gamePaused and self.okToMoveLeft():
@@ -254,6 +259,8 @@ class Shape:
     def drop(self):
         if not self.game.gamePaused:
             self.delay = DropDownDelay
+            # Cancel the pending slow tick and trigger a fast one immediately
+            self.game.force_immediate_tick()
 
 
 class AShape(Shape):
@@ -513,13 +520,12 @@ class Game:
         self.lines = self.createLines()
         self.gameOver = False
         self.gamePaused = False
-       
         self.delay = MoveDownDelay
         self.speed = 1
         self.speedText = self.canvas.create_text(ScreenMaxX-65, 3, anchor=tkinter.NW, text="SPEED:")
-
         self.score = 0
         self.scoreText = self.canvas.create_text(4, 3, anchor=tkinter.NW, text="SCORE:")
+        self.loop_job = None  # Tracks the scheduled .after job
         
     def createLines(self):
         lines = []
@@ -541,49 +547,6 @@ class Game:
     
     def shapeAlive(self):
         return (self.shape.alive)
-        
-    def run(self):
-        debug_print ("run")
-
-        def onArrowLeftKey(event = None):
-            if not self.gameOver:
-                self.shape.moveLeft()
-            
-        def onArrowRightKey(event = None):
-            if not self.gameOver:
-                self.shape.moveRight()
-        
-        def onArrowUpKey(event = None):
-            if not self.gameOver:
-                self.shape.rotate()
-        
-        def onArrowDownKey(event = None):
-            self.shape.drop()
-            
-        def onPKey(event = None):
-            self.gamePaused  = not self.gamePaused 				
-        
-        self.canvas.bind_all("<Left>", onArrowLeftKey)
-        self.canvas.bind_all("<Right>", onArrowRightKey)
-        self.canvas.bind_all("<Up>", onArrowUpKey)
-        self.canvas.bind_all("<Down>", onArrowDownKey)
-        self.canvas.bind_all("<p>", onPKey)
-
-        self.printScore()
-        self.printSpeed()
-
-        self.createRandShape()
-
-        while (not self.gameOver and self.canvas.winfo_exists()):
-            try:
-                self.master.update()
-                if self.shapeAlive():
-                    self.shape.moveDown()
-                else:
-                    if not self.gameOver:
-                        self.createRandShape()
-            except tkinter.TclError:
-                break
 
     def printSpeed(self):
         self.canvas.delete(self.speedText)
@@ -591,24 +554,42 @@ class Game:
 
     def printScore(self, final=False):
         if final:
-			# create button, link it to clickExitButton()
+            # create button, link it to clickExitButton()
             self.restartButton = tkinter.Button(self.master, text="Restart game", command=self.restartGame)
-
             # place button at (0,0)
             self.restartButton.place(x=5, y=ScreenMaxY-27)
+            
+            # --- FIX: Flash the game over text safely without blocking the main UI loop ---
+            def flash_game_over():
+                inc = 1
+                fontDim = 11
+                while self.gameOver and self.canvas.winfo_exists():
+                    try:
+                        fontDim = fontDim + inc * 2
+                        variableFont = ('freemono', fontDim, 'bold')
+                        
+                        # Use master.after to safely update the text size across threads
+                        def update_text(f=variableFont):
+                            if self.canvas.winfo_exists():
+                                self.canvas.delete(self.scoreText)
+                                self.scoreText = self.canvas.create_text(
+                                    4, 3, anchor=tkinter.NW, fill=colorBlack, font=f, text="SCORE: {}".format(self.score)
+                                )
+                        
+                        self.master.after(0, update_text)
+                        time.sleep(MoveDownDelay)
+                        inc = -inc
+                    except (tkinter.TclError, RuntimeError):
+                        break  # Stop thread if window is destroyed
 
-            inc = 1
-            fontDim = 11
-            while self.gameOver:
-                for i in range(2):
-                    fontDim = fontDim + inc*2
-                    variableFont = ('freemono', fontDim, 'bold')
-                    time.sleep(MoveDownDelay)
-                    self.canvas.delete(self.scoreText)
-                    self.scoreText = self.canvas.create_text(4, 3, anchor=tkinter.NW, fill=colorBlack, font=variableFont, text="SCORE: {}".format(self.score))
-                inc = -inc
-        self.canvas.delete(self.scoreText)
-        self.scoreText = self.canvas.create_text(4, 3, anchor=tkinter.NW, fill=colorBlack, font=NormalFont, text="SCORE: {}".format(self.score))
+            # Keep the flashing animation on a throwaway background thread so mainloop never freezes
+            threading.Thread(target=flash_game_over, daemon=True).start()
+            return
+
+        # Normal score print behavior
+        if self.canvas.winfo_exists():
+            self.canvas.delete(self.scoreText)
+            self.scoreText = self.canvas.create_text(4, 3, anchor=tkinter.NW, fill=colorBlack, font=NormalFont, text="SCORE: {}".format(self.score))
     
     def checkAndUpdateSpeed(self):
         if self.score < 100000:
@@ -617,19 +598,92 @@ class Game:
             self.printSpeed()
 
     def restartGame(self):
-        self.restartButton.destroy()        
+        # 1. Clean up UI elements
+        self.restartButton.destroy()
+        
+        # 2. Reset game state flags and scores
+        self.gameOver = False
+        self.gamePaused = False
+        self.speed = 1
+        self.score = 0
+        self.delay = MoveDownDelay # Reset fall delay back to level 1 normal speed
+        
+        # 3. Clear all visual canvas blocks and grid memories
         for line in self.lines:
             for x in range(mox-1):
                 r = line[x]
                 if r is not None:
                     self.canvas.delete(r)
-                    line[x] = None
-        self.gameOver = False
-        self.speed = 1
-        self.score = 0
+                line[x] = None
+        
+        # 4. Redraw score texts to normal sizes
         self.printScore()
+        self.printSpeed()
+        
+        # 5. Generate a clean initial piece and kickstart the core engine ticker again
+        self.createRandShape()
+        self.game_tick()
+        
+    def run(self):
+        """Sets up keybinds and kicks off the initial loop tick."""
+        debug_print("run")
+        
+        def onArrowLeftKey(event = None):
+            if not self.gameOver and not self.gamePaused: self.shape.moveLeft()
+        def onArrowRightKey(event = None):
+            if not self.gameOver and not self.gamePaused: self.shape.moveRight()
+        def onArrowUpKey(event = None):
+            if not self.gameOver and not self.gamePaused: self.shape.rotate()
+        def onArrowDownKey(event = None):
+            if not self.gameOver and not self.gamePaused: self.shape.drop()
+        def onPKey(event = None):
+            self.gamePaused = not self.gamePaused
+
+        self.canvas.bind_all("<Left>", onArrowLeftKey)
+        self.canvas.bind_all("<Right>", onArrowRightKey)
+        self.canvas.bind_all("<Up>", onArrowUpKey)
+        self.canvas.bind_all("<Down>", onArrowDownKey)
+        self.canvas.bind_all("<p>", onPKey)
+        
+        self.printScore()
+        self.printSpeed()
+        self.createRandShape()
+        
+        # Start the non-blocking loop
+        self.game_tick()
+
+    def force_immediate_tick(self):
+        """Cancels the active scheduled tick and fires a new one instantly."""
+        if self.loop_job:
+            self.master.after_cancel(self.loop_job)
+            self.loop_job = None
+        
+        # Run the game logic right now
+        self.game_tick()
+
+    def game_tick(self):
+        """The single-threaded tick handler (Fully updated for clean resets)."""
+        if not self.canvas.winfo_exists():
+            return
+
+        if not self.gameOver:
+            if not self.gamePaused:
+                if self.shapeAlive():
+                    self.shape.moveDownSingleThreaded()
+                else:
+                    # Piece just died/landed! Re-calculate normal speed before creating the next piece
+                    self.checkAndUpdateSpeed()
+                    if not self.gameOver:
+                        self.createRandShape()
+
+            # Convert current delay into milliseconds
+            delay_ms = int(self.delay * 1000)
+            
+            # Schedule the next frame
+            self.loop_job = self.master.after(delay_ms, self.game_tick)
 
 
+# --- REFACTORED MAIN ENTRYPOINT (NO THREADING IMPORT REQUIRED) ---
 def main():
     master = tkinter.Tk()
     master.title("T E T R I S by π/R")
@@ -637,31 +691,26 @@ def main():
     master.minsize(ScreenMaxX+5, ScreenMaxY+20)
     master.maxsize(ScreenMaxX+5, ScreenMaxY+20)
 
-    def reset_size(event):
-        pass
-    master.bind('<Configure>', reset_size)
-    
     canvas = tkinter.Canvas(master, bg=DefaultBG, width=ScreenMaxX, height=ScreenMaxY)
     canvas.pack(expand=False)
     canvas.create_rectangle(3, 3, ScreenMaxX, ScreenMaxY, width = 2)
     canvas.create_rectangle(20, 20, ScreenMaxX-20, ScreenMaxY-20, width = 1)
     canvas.focus()
-
-    game =  Game(master, canvas)
-    def tetrisRun():
-        debug_print ("tetrisRun")
-        game.run()
-
-    thread = threading.Thread(target = tetrisRun, daemon=True)
-    thread.start()
+    
+    game = Game(master, canvas)
 
     def on_closing():
         game.gameOver = True
+        if game.loop_job:
+            master.after_cancel(game.loop_job) # Safely un-schedule pending loops
         debug_print("master destroy")
         master.quit()
         master.destroy()
-    master.protocol("WM_DELETE_WINDOW", on_closing)
 
+    master.protocol("WM_DELETE_WINDOW", on_closing)
+    
+    # Fire up the engine directly on the main event thread
+    game.run() 
     master.mainloop()
 
 if __name__ == "__main__":
