@@ -34,8 +34,6 @@ Production Strengths
 🎮 How to Run
 
 Because the project leverages zero external dependencies outside Python's core toolkit, you can launch the game straight out of the box.
-bash
-# Clone this repository or copy the code file
 python tetris.py
 
 Key Controls
